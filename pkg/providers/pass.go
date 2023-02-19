@@ -73,7 +73,6 @@ func NewPass(logger logging.Logger) (core.Provider, error) {
 
 func (e *Pass) pass(args ...string) *exec.Cmd {
 	cmd := exec.Command("pass", args...)
-	// cmd := exec.Command("gpg", "--decrypt", "/home/vince/.password-store/gitlab/pat.gpg")
 	if e.passDir != "" {
 		cmd.Env = append(os.Environ(), fmt.Sprintf("PASSWORD_STORE_DIR=%s", e.passDir))
 	}
@@ -84,8 +83,6 @@ func (e *Pass) pass(args ...string) *exec.Cmd {
 }
 
 func (e *Pass) itemExists(key string) (string, error) {
-	// var path = filepath.Join(k.passDir, k.prefix, key+".gpg")
-
 	var path = filepath.Join(e.passDir, key+".gpg")
 	e.logger.WithFields(map[string]interface{}{
 		"key":  key,
@@ -116,33 +113,9 @@ func (e *Pass) PutMapping(p core.KeyPath, m map[string]string) error {
 
 // GetMapping returns a multiple entries
 func (e *Pass) GetMapping(p core.KeyPath) ([]core.EnvEntry, error) {
-
 	return []core.EnvEntry{}, fmt.Errorf("provider %q does not implement write yet", e.Name())
 }
 
-// Get returns a single entry
-// func (e *Pass) Get(p core.KeyPath) (*core.EnvEntry, error) {
-// 	ent := p.Missing()
-// 	found := e.itemExists(p.Path)
-// 	if !found {
-// 		e.logger.WithField("path", p.Path).Debug("secret not found in path")
-// 		return nil, fmt.Errorf("%v path: %s not exists", KeyPassName, p.Path)
-// 	}
-
-// 	// name := filepath.Join(e.prefix, key)
-// 	cmd := e.pass("show", p.Path)
-// 	output, err := cmd.Output()
-// 	if err != nil {
-// 		e.logger.WithField("path", p.Path).Debug("failed to get pass output")
-// 		return nil, fmt.Errorf("%v path: %s output error (%s)", KeyPassName, p.Path, err.Error())
-// 	}
-
-// 	// var decoded Item
-// 	// err = json.Unmarshal(output, &decoded)
-
-//		ent = p.Found(string(output))
-//		return &ent, nil
-//	}
 var gpgmeMutex sync.Mutex
 
 func (e *Pass) decrypt(path string) (io.Reader, error) {
