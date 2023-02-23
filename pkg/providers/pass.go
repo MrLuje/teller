@@ -16,8 +16,147 @@ import (
 	"github.com/spectralops/teller/pkg/logging"
 )
 
+type PassClient interface {
+	Get(path string, withPrefix bool) (map[string]string, error)
+	Set(path string, val string) error
+}
+
+type PassReader struct {
+	logger  logging.Logger
+	passDir string
+}
+
+var gpgmeMutex sync.Mutex
+
+func (e *PassReader) Get(keyPath string, withMapping bool) (map[string]string, error) {
+	if withMapping {
+		return e.GetWithPrefix(keyPath)
+	}
+
+	data := make(map[string]string)
+	var filePath = e.toFilePath(keyPath)
+
+	gpgmeMutex.Lock()
+	defer gpgmeMutex.Unlock()
+
+	decrypted, err := e.Decrypt(filePath)
+	if err != nil {
+		e.logger.WithField("path", keyPath).WithError(err).Error("fail to decrypt")
+		return nil, err
+	}
+
+	data[keyPath] = decrypted
+	return data, nil
+}
+
+func (e *PassReader) GetWithPrefix(keyPath string) (map[string]string, error) {
+	dirPath := filepath.Join(e.passDir, keyPath)
+	info, err := os.Stat(dirPath)
+	if err != nil {
+		e.logger.WithField("path", dirPath).Debug("secret doesn't exist")
+		return nil, err
+	}
+	if !info.IsDir() {
+		e.logger.WithField("path", dirPath).Debug("path is not a directory")
+		return nil, fmt.Errorf("path is not a directory")
+	}
+
+	files := make([]string, 0)
+	filepath.WalkDir(dirPath, func(s string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		e.logger.WithField("path", s).WithField("isDir", d.IsDir()).WithField("ext", filepath.Ext(d.Name())).Debug("walking")
+		if !d.IsDir() && filepath.Ext(d.Name()) == ".gpg" {
+			e.logger.WithField("path", s).Debug("found gpg file")
+			files = append(files, s)
+		}
+		return nil
+	})
+
+	gpgmeMutex.Lock()
+	defer gpgmeMutex.Unlock()
+
+	data := make(map[string]string)
+
+	for _, path := range files {
+		decrypted, err := e.Decrypt(path)
+		if err != nil {
+			e.logger.WithField("path", path).WithError(err).Error("fail to read")
+			return nil, err
+		}
+		entryKey := strings.Trim(strings.Replace(e.toKeyPath(path), keyPath, "", -1), "/")
+		data[entryKey] = decrypted
+	}
+
+	return data, nil
+}
+
+func (e *PassReader) Set(keyPath string, val string) error {
+	var filePath = e.toFilePath(keyPath)
+	gpgmeMutex.Lock()
+	defer gpgmeMutex.Unlock()
+
+	file, err := os.Create(filePath)
+	if err != nil {
+		e.logger.WithField("path", keyPath).Debug("failed to create file")
+		return err
+	}
+	defer file.Close()
+
+	data, err := gpgme.NewDataFile(file)
+	if err != nil {
+		e.logger.WithField("path", keyPath).Debug("failed to create datawriter for file")
+		return err
+	}
+	defer data.Close()
+	_, err = data.Write([]byte(val))
+	if err != nil {
+		e.logger.WithField("path", keyPath).Debug("failed to write data to file")
+		return err
+	}
+	return nil
+}
+
+func (e *PassReader) toFilePath(path string) string {
+	return filepath.Join(e.passDir, path+".gpg")
+}
+
+func (e *PassReader) toKeyPath(path string) string {
+	return strings.TrimSuffix(strings.Replace(path, e.passDir, "", -1), ".gpg")
+}
+
+func (e *PassReader) Decrypt(filePath string) (string, error) {
+	if _, err := os.Stat(filePath); err != nil {
+		e.logger.WithField("path", filePath).Debug("secret not found in path")
+		return "", fmt.Errorf("%v path: %s not exists", KeyPassName, filePath)
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	decrypted, err := gpgme.Decrypt(file)
+	if err != nil {
+		e.logger.WithField("path", filePath).WithError(err).Error("fail to decrypt")
+		return "", err
+	}
+
+	nr := bufio.NewReader(decrypted)
+	password, err := nr.ReadString('\n')
+	if err != nil {
+		e.logger.WithField("decrypted", decrypted).WithError(err).Error("fail to read decrypted")
+		return "", err
+	}
+
+	return strings.Trim(password, "\n"), nil
+}
+
 type Pass struct {
 	passDir string
+	client  PassClient
 	logger  logging.Logger
 }
 
@@ -49,36 +188,18 @@ func NewPass(logger logging.Logger) (core.Provider, error) {
 
 		passDir = filepath.Join(homeDir, ".password-store")
 		if _, err := os.Stat(passDir); err != nil {
-			return nil, fmt.Errorf("missing `PASSWORD_STORE_DIR` and can't find in `%s`", passDir)
+			return nil, fmt.Errorf("missing `PASSWORD_STORE_DIR` and `%s` doesn't exist", passDir)
 		}
 	}
 
 	return &Pass{
 		logger:  logger,
 		passDir: passDir,
+		client: &PassReader{
+			passDir: passDir,
+			logger:  logger,
+		},
 	}, nil
-}
-
-func (e *Pass) toFilePath(path string) string {
-	return filepath.Join(e.passDir, path+".gpg")
-}
-
-func (e *Pass) toPath(path string) string {
-	return strings.TrimSuffix(strings.Replace(path, e.passDir, "", -1), ".gpg")
-}
-
-func (e *Pass) itemExists(key string) (string, error) {
-	var path = e.toFilePath(key)
-	e.logger.WithFields(map[string]interface{}{
-		"key":  key,
-		"path": path,
-	}).Debug("checking for secret")
-
-	_, err := os.Stat(path)
-
-	e.logger.WithField("found", err == nil).Debug("secret has been")
-
-	return path, err
 }
 
 // Name return the provider name
@@ -88,30 +209,7 @@ func (e *Pass) Name() string {
 
 // Put will create a new single entry
 func (e *Pass) Put(p core.KeyPath, val string) error {
-	gpgmeMutex.Lock()
-	defer gpgmeMutex.Unlock()
-
-	var filePath = e.toFilePath(p.Path)
-
-	file, err := os.Create(filePath)
-	if err != nil {
-		e.logger.WithField("path", p.Path).Debug("failed to create file")
-		return err
-	}
-	defer file.Close()
-
-	data, err := gpgme.NewDataFile(file)
-	if err != nil {
-		e.logger.WithField("path", p.Path).Debug("failed to create datawriter for file")
-		return err
-	}
-	defer data.Close()
-	rCode, err := data.Write([]byte(val))
-	if err != nil {
-		e.logger.WithField("path", p.Path).WithField("code", rCode).Debug("failed to write data to file")
-		return err
-	}
-	return nil
+	return e.client.Set(p.Path, val)
 }
 
 // PutMapping will create a multiple entries
@@ -121,87 +219,29 @@ func (e *Pass) PutMapping(p core.KeyPath, m map[string]string) error {
 
 // GetMapping returns a multiple entries
 func (e *Pass) GetMapping(p core.KeyPath) ([]core.EnvEntry, error) {
-	dirPath := filepath.Join(e.passDir, p.Path)
-	info, err := os.Stat(dirPath)
+	data, err := e.client.Get(p.Path, true)
 	if err != nil {
-		e.logger.WithField("path", dirPath).Debug("secret does'nt exist")
 		return nil, err
 	}
-	if !info.IsDir() {
-		e.logger.WithField("path", dirPath).Debug("path is not a directory")
-		return nil, fmt.Errorf("path is not a directory")
-	}
 
-	files := make([]string, 0)
-	filepath.WalkDir(dirPath, func(s string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		e.logger.WithField("path", s).WithField("isDir", d.IsDir()).WithField("ext", filepath.Ext(d.Name())).Debug("walking")
-		if !d.IsDir() && filepath.Ext(d.Name()) == ".gpg" {
-			e.logger.WithField("path", s).Debug("found file")
-			files = append(files, s)
-		}
-		return nil
-	})
-
-	gpgmeMutex.Lock()
-	defer gpgmeMutex.Unlock()
 	entries := []core.EnvEntry{}
-	for _, path := range files {
-		data, err := e.decrypt(path)
-		if err != nil {
-			e.logger.WithField("path", path).WithError(err).Error("fail to read")
-			return nil, err
-		}
-		entryKey := strings.Trim(strings.Replace(e.toPath(path), p.Path, "", -1), "/")
-		entries = append(entries, p.FoundWithKey(entryKey, data))
+	for k, val := range data {
+		entries = append(entries, p.FoundWithKey(k, val))
 	}
 	sort.Sort(core.EntriesByKey(entries))
 	return entries, nil
 }
 
-var gpgmeMutex sync.Mutex
-
-func (e *Pass) decrypt(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		e.logger.WithError(err)
-		return "", err
-	}
-	defer file.Close()
-	decrypted, err := gpgme.Decrypt(file)
-	if err != nil {
-		e.logger.WithField("path", path).WithError(err).Error("fail to decrypt")
-	}
-
-	nr := bufio.NewReader(decrypted)
-	password, err := nr.ReadString('\n')
-
-	if err != nil {
-		e.logger.WithField("decrypted", decrypted).WithError(err).Error("fail to read decrypted")
-	}
-	return strings.Trim(password, "\n"), nil
-}
-
 // Get returns a single entry
 func (e *Pass) Get(p core.KeyPath) (*core.EnvEntry, error) {
 	ent := p.Missing()
-	path, err := e.itemExists(p.Path)
-	if err != nil {
-		e.logger.WithField("path", p.Path).Debug("secret not found in path")
-		return nil, fmt.Errorf("%v path: %s not exists", KeyPassName, p.Path)
-	}
 
-	gpgmeMutex.Lock()
-	defer gpgmeMutex.Unlock()
-	password, err := e.decrypt(path)
+	data, err := e.client.Get(p.Path, false)
 	if err != nil {
-		e.logger.WithField("path", p.Path).Debug("failed to decrypt secret")
 		return nil, err
 	}
 
-	ent = p.Found(string(password))
+	ent = p.Found(string(data[p.Path]))
 	return &ent, nil
 }
 
@@ -214,3 +254,11 @@ func (e *Pass) Delete(kp core.KeyPath) error {
 func (e *Pass) DeleteMapping(kp core.KeyPath) error {
 	return fmt.Errorf("provider %s does not implement delete yet", e.Name())
 }
+
+// func (e *Pass) toFilePath(path string) string {
+// 	return filepath.Join(e.passDir, path+".gpg")
+// }
+
+// func (e *Pass) toPath(path string) string {
+// 	return strings.TrimSuffix(strings.Replace(path, e.passDir, "", -1), ".gpg")
+// }
