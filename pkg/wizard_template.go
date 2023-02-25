@@ -271,9 +271,11 @@ providers:
 {{- if index .ProviderKeys "pass" }}
 
   pass:
+    env_sync:
+      path: gitlab
     env:
-      ETC_DSN:
-        field: SOME_KEY # Optional, accesses the environment variable SOME_KEY and maps it to ETC_DSN
+      TOKEN:
+        path: gitlab/token # token can be omitted in this case if field of env matches 
 
 {{end}}
 `

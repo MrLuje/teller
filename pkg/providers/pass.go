@@ -3,8 +3,8 @@ package providers
 import (
 	"bufio"
 	"fmt"
-	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -17,8 +17,9 @@ import (
 )
 
 type PassClient interface {
-	Get(path string, withPrefix bool) (map[string]string, error)
+	Get(path string) (map[string]string, error)
 	Set(path string, val string) error
+	SetMultiple(keyPath string, m map[string]string) error
 }
 
 type PassReader struct {
@@ -28,13 +29,13 @@ type PassReader struct {
 
 var gpgmeMutex sync.Mutex
 
-func (e *PassReader) Get(keyPath string, withMapping bool) (map[string]string, error) {
-	if withMapping {
+func (e *PassReader) Get(keyPath string) (map[string]string, error) {
+	var filePath = e.toFilePath(keyPath)
+	if _, err := os.Stat(filePath); err != nil {
 		return e.GetWithPrefix(keyPath)
 	}
 
 	data := make(map[string]string)
-	var filePath = e.toFilePath(keyPath)
 
 	gpgmeMutex.Lock()
 	defer gpgmeMutex.Unlock()
@@ -62,38 +63,70 @@ func (e *PassReader) GetWithPrefix(keyPath string) (map[string]string, error) {
 	}
 
 	files := make([]string, 0)
-	filepath.WalkDir(dirPath, func(s string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
+	dirEntries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, dirEntry := range dirEntries {
+		e.logger.WithField("path", dirPath).WithField("isDir", dirEntry.IsDir()).WithField("ext", filepath.Ext(dirEntry.Name())).Debug("walking")
+		if !dirEntry.IsDir() && filepath.Ext(dirEntry.Name()) == ".gpg" {
+			fileName := filepath.Join(dirPath, dirEntry.Name())
+			e.logger.WithField("path", fileName).Debug("found gpg file")
+			files = append(files, fileName)
 		}
-		e.logger.WithField("path", s).WithField("isDir", d.IsDir()).WithField("ext", filepath.Ext(d.Name())).Debug("walking")
-		if !d.IsDir() && filepath.Ext(d.Name()) == ".gpg" {
-			e.logger.WithField("path", s).Debug("found gpg file")
-			files = append(files, s)
-		}
-		return nil
-	})
+	}
 
 	gpgmeMutex.Lock()
 	defer gpgmeMutex.Unlock()
 
 	data := make(map[string]string)
 
-	for _, path := range files {
-		decrypted, err := e.Decrypt(path)
+	for _, filePath := range files {
+		decrypted, err := e.Decrypt(filePath)
 		if err != nil {
-			e.logger.WithField("path", path).WithError(err).Error("fail to read")
+			e.logger.WithField("path", filePath).WithError(err).Error("fail to read")
 			return nil, err
 		}
-		entryKey := strings.Trim(strings.Replace(e.toKeyPath(path), keyPath, "", -1), "/")
+
+		entryKey := strings.Trim(strings.TrimPrefix(e.toKeyPath(filePath), keyPath), "/")
 		data[entryKey] = decrypted
 	}
 
 	return data, nil
 }
 
+func (e *PassReader) FindGpgKey(filePath string) (string, error) {
+	for {
+		tryFolder := path.Dir(filePath)
+		tryGpgFile := filepath.Join(tryFolder, ".gpg-id")
+
+		if _, err := os.Stat(tryGpgFile); err == nil {
+			return tryGpgFile, nil
+		}
+
+		e.logger.WithField("path", tryGpgFile).Error("no gpg key")
+
+		if tryFolder == e.passDir {
+			break
+		}
+	}
+
+	return "", fmt.Errorf("there is no gpg store here or in parent folders")
+}
+
 func (e *PassReader) Set(keyPath string, val string) error {
 	var filePath = e.toFilePath(keyPath)
+
+	gpgKey, err := e.FindGpgKey(filePath)
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(gpgKey)
+	if err != nil {
+		return err
+	}
+
 	gpgmeMutex.Lock()
 	defer gpgmeMutex.Unlock()
 
@@ -103,18 +136,56 @@ func (e *PassReader) Set(keyPath string, val string) error {
 		return err
 	}
 	defer file.Close()
-
 	data, err := gpgme.NewDataFile(file)
 	if err != nil {
 		e.logger.WithField("path", keyPath).Debug("failed to create datawriter for file")
 		return err
 	}
 	defer data.Close()
-	_, err = data.Write([]byte(val))
+
+	ctx, err := gpgme.New()
 	if err != nil {
-		e.logger.WithField("path", keyPath).Debug("failed to write data to file")
 		return err
 	}
+
+	fingerprint := string(b)
+	key, err := ctx.GetKey(strings.Trim(fingerprint, "\n"), false)
+	if err != nil {
+		e.logger.WithField("fingerprint", fingerprint).Debug("cannot find key with this fingerprint")
+		return fmt.Errorf("invalid gpg store")
+	}
+
+	gpgVal, _ := gpgme.NewDataBytes([]byte(val + "\n"))
+
+	err = ctx.Encrypt([]*gpgme.Key{key}, gpgme.EncryptAlwaysTrust, gpgVal, data)
+	if err != nil {
+		e.logger.WithField("key", key.IssuerName()).Debug("failed to encrypt data")
+		return fmt.Errorf("failed to encrypt data")
+	}
+
+	return nil
+}
+
+func (e *PassReader) SetMultiple(keyPath string, m map[string]string) error {
+	var filePath = filepath.Join(e.passDir, keyPath)
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		err = os.MkdirAll(filePath, os.ModePerm)
+		if err != nil {
+			return err
+		}
+	}
+
+	for key, value := range m {
+		fullPath := filepath.Join(keyPath, key)
+		if err := e.Set(fullPath, value); err != nil {
+			e.logger.WithFields(map[string]interface{}{
+				"path":     keyPath,
+				"filePath": fullPath,
+			}).Debug("failed to write data to file")
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -214,12 +285,12 @@ func (e *Pass) Put(p core.KeyPath, val string) error {
 
 // PutMapping will create a multiple entries
 func (e *Pass) PutMapping(p core.KeyPath, m map[string]string) error {
-	return fmt.Errorf("provider %q does not implement write yet", e.Name())
+	return e.client.SetMultiple(p.Path, m)
 }
 
 // GetMapping returns a multiple entries
 func (e *Pass) GetMapping(p core.KeyPath) ([]core.EnvEntry, error) {
-	data, err := e.client.Get(p.Path, true)
+	data, err := e.client.Get(p.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -236,12 +307,26 @@ func (e *Pass) GetMapping(p core.KeyPath) ([]core.EnvEntry, error) {
 func (e *Pass) Get(p core.KeyPath) (*core.EnvEntry, error) {
 	ent := p.Missing()
 
-	data, err := e.client.Get(p.Path, false)
+	data, err := e.client.Get(p.Path)
 	if err != nil {
 		return nil, err
 	}
 
-	ent = p.Found(string(data[p.Path]))
+	if data[p.Path] != "" {
+		ent = p.Found(data[p.Path])
+		return &ent, nil
+	}
+
+	if p.Env != "" && data[p.Env] != "" {
+		ent = p.Found(data[p.Env])
+		return &ent, nil
+	}
+
+	if p.Field != "" && data[p.Field] != "" {
+		ent = p.Found(data[p.Field])
+		return &ent, nil
+	}
+
 	return &ent, nil
 }
 
@@ -254,11 +339,3 @@ func (e *Pass) Delete(kp core.KeyPath) error {
 func (e *Pass) DeleteMapping(kp core.KeyPath) error {
 	return fmt.Errorf("provider %s does not implement delete yet", e.Name())
 }
-
-// func (e *Pass) toFilePath(path string) string {
-// 	return filepath.Join(e.passDir, path+".gpg")
-// }
-
-// func (e *Pass) toPath(path string) string {
-// 	return strings.TrimSuffix(strings.Replace(path, e.passDir, "", -1), ".gpg")
-// }

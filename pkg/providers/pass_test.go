@@ -18,12 +18,15 @@ func TestPass(t *testing.T) {
 	client := mock_providers.NewMockPassClient(ctrl)
 	path := "settings/prod/billing-svc"
 	pathmap := "settings/prod/billing-svc/all"
-	out := map[string]string{
-		"settings/prod/billing-svc/MG_KEY":    "shazam",
-		"settings/prod/billing-svc/SMTP_PASS": "mailman",
+	single := map[string]string{
+		"MG_KEY": "shazam",
 	}
-	client.EXPECT().Get(gomock.Eq(path), false).Return(out, nil).AnyTimes()
-	client.EXPECT().Get(gomock.Eq(pathmap), true).Return(out, nil).AnyTimes()
+	out := map[string]string{
+		"MG_KEY":    "shazam",
+		"SMTP_PASS": "mailman",
+	}
+	client.EXPECT().Get(gomock.Eq(path)).Return(single, nil).AnyTimes()
+	client.EXPECT().Get(gomock.Eq(pathmap)).Return(out, nil).AnyTimes()
 	s := Pass{
 		client: client,
 		logger: GetTestLogger(),
@@ -36,7 +39,7 @@ func TestPassFailures(t *testing.T) {
 	// Assert that Bar() is invoked.
 	defer ctrl.Finish()
 	client := mock_providers.NewMockPassClient(ctrl)
-	client.EXPECT().Get(gomock.Any(), true).Return(nil, errors.New("error")).AnyTimes()
+	client.EXPECT().Get(gomock.Any()).Return(nil, errors.New("error")).AnyTimes()
 	s := Pass{
 		client: client,
 		logger: GetTestLogger(),

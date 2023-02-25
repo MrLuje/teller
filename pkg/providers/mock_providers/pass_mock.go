@@ -34,18 +34,18 @@ func (m *MockPassClient) EXPECT() *MockPassClientMockRecorder {
 }
 
 // Get mocks base method.
-func (m *MockPassClient) Get(path string, withPrefix bool) (map[string]string, error) {
+func (m *MockPassClient) Get(path string) (map[string]string, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Get", path, withPrefix)
+	ret := m.ctrl.Call(m, "Get", path)
 	ret0, _ := ret[0].(map[string]string)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // Get indicates an expected call of Get.
-func (mr *MockPassClientMockRecorder) Get(path, withPrefix interface{}) *gomock.Call {
+func (mr *MockPassClientMockRecorder) Get(path interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Get", reflect.TypeOf((*MockPassClient)(nil).Get), path, withPrefix)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Get", reflect.TypeOf((*MockPassClient)(nil).Get), path)
 }
 
 // Set mocks base method.
@@ -60,4 +60,18 @@ func (m *MockPassClient) Set(path, val string) error {
 func (mr *MockPassClientMockRecorder) Set(path, val interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Set", reflect.TypeOf((*MockPassClient)(nil).Set), path, val)
+}
+
+// SetMultiple mocks base method.
+func (m_2 *MockPassClient) SetMultiple(keyPath string, m map[string]string) error {
+	m_2.ctrl.T.Helper()
+	ret := m_2.ctrl.Call(m_2, "SetMultiple", keyPath, m)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// SetMultiple indicates an expected call of SetMultiple.
+func (mr *MockPassClientMockRecorder) SetMultiple(keyPath, m interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetMultiple", reflect.TypeOf((*MockPassClient)(nil).SetMultiple), keyPath, m)
 }
